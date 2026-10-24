@@ -36,13 +36,23 @@ def _session_has_live_transport(session: dict | None, *, excluding=None) -> bool
 
 
 def _transport_auth_user_id(transport) -> str | None:
-    """``<provider>:<user id>`` the WS-upgrade credential authenticated for ``transport``, or None for the legacy
-    token, stdio and the PTY child's server-internal credential. The prefix keeps a basic-auth ``alice`` and an
-    OIDC ``alice`` apart."""
-    from gateway.session_identity import is_authenticated_identity
+    """The full ``auth:v1:[provider, issuer, user]`` subject the WS-upgrade credential
+    authenticated for ``transport`` (:func:`gateway.session_identity.authenticated_subject`),
+    or None for the legacy token, stdio and the PTY child's server-internal credential.
+
+    Previously stamped the shorter ``<provider>:<user>`` form (issuer dropped) — that was enough
+    to keep a basic-auth ``alice`` and an OIDC ``alice`` apart, but any login whose provider is
+    pinned to more than one issuer (every real self-hosted/Nous OIDC login carries one) could
+    then never satisfy an exact-subject comparison against its own stamped row
+    (``hermes_state_mutation_binding.py::authorize_history``). Reusing ``authenticated_subject``
+    keeps this in sync with the one format live authorization already compares against, instead
+    of this function maintaining its own second encoding of the same identity. Rows stamped
+    under the old short form remain reachable via the bounded legacy-label fallback in
+    ``hermes_state_mutation_binding.py`` until their genuine owner's first touch upgrades them."""
+    from gateway.session_identity import authenticated_subject, is_authenticated_identity
     identity = getattr(transport, "auth_identity", None)
     if is_authenticated_identity(identity):
-        return f"{str(identity['provider']).strip()}:{str(identity['user_id']).strip()}"
+        return authenticated_subject(identity)
     return None
 
 

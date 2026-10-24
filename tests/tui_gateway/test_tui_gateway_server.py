@@ -4665,17 +4665,22 @@ def _capture_make_agent_kwargs(monkeypatch) -> dict:
 
 
 @pytest.mark.parametrize("identity, user_id", [
-    ({"user_id": "oidc|abc123", "provider": "oidc"}, "oidc:oidc|abc123"),
-    ({"user_id": "alice", "provider": "basic"}, "basic:alice"),
-    ({"user_id": "alice", "provider": "oidc"}, "oidc:alice"),
+    ({"user_id": "oidc|abc123", "provider": "oidc"},
+     'auth:v1:["oidc","","oidc|abc123"]'),
+    ({"user_id": "alice", "provider": "basic"}, 'auth:v1:["basic","","alice"]'),
+    ({"user_id": "alice", "provider": "oidc"}, 'auth:v1:["oidc","","alice"]'),
     (None, None),
     ({"user_id": "server-internal", "provider": "server-internal"}, None),
     ({"user_id": "", "provider": "oidc"}, None),
     ({"user_id": "abc", "provider": ""}, None),
 ])
 def test_make_agent_passes_the_authenticated_dashboard_user_as_user_id(monkeypatch, identity, user_id):
-    """WSTransport.auth_identity reaches the agent as ``user_id`` prefixed with the login provider, so a
-    basic-auth ``alice`` and an OIDC ``alice`` stay two memory peers. The legacy token, stdio and the PTY
+    """WSTransport.auth_identity reaches the agent as the full ``auth:v1:[provider, issuer, user]``
+    subject (``gateway.session_identity.authenticated_subject``) — not just ``<provider>:<user>`` —
+    so a basic-auth ``alice`` and an OIDC ``alice`` stay two memory peers, and so do two OIDC
+    ``alice``s from different issuers (the shorter form dropped the issuer unconditionally, which
+    an issuer-pinned provider like a self-hosted OIDC login could never satisfy later — see
+    hermes_state_mutation_binding.py::authorize_history). The legacy token, stdio and the PTY
     child's server-internal credential name no human, so the agent gets no user id for them."""
     captured = _capture_make_agent_kwargs(monkeypatch)
     transport = types.SimpleNamespace(auth_identity=identity)
@@ -4723,11 +4728,11 @@ def test_make_agent_keeps_the_login_after_a_second_window_attaches_and_detaches(
 
     assert server._attach_session_transport(record, popout)
     server._make_agent("sid-popout", "k")
-    assert captured["user_id"] == "basic:alice"
+    assert captured["user_id"] == 'auth:v1:["basic","","alice"]'
 
     server._detach_session_transport(record, popout)
     server._make_agent("sid-popout", "k")
-    assert captured["user_id"] == "basic:alice"
+    assert captured["user_id"] == 'auth:v1:["basic","","alice"]'
 
 
 def test_build_branch_agent_carries_the_parent_login(monkeypatch, tmp_path):
@@ -4750,8 +4755,8 @@ def test_build_branch_agent_carries_the_parent_login(monkeypatch, tmp_path):
     finally:
         reset_transport(token)
 
-    assert captured["user_id"] == "basic:alice"
-    assert server._sessions["sid-branch"]["auth_user_id"] == "basic:alice"
+    assert captured["user_id"] == 'auth:v1:["basic","","alice"]'
+    assert server._sessions["sid-branch"]["auth_user_id"] == 'auth:v1:["basic","","alice"]'
 
 
 def test_deferred_session_record_stamps_the_creating_login():
@@ -4762,8 +4767,8 @@ def test_deferred_session_record_stamps_the_creating_login():
     finally:
         reset_transport(token)
 
-    assert record["auth_user_id"] == "oidc:carol"
-    assert server._session_auth_user_id(record) == "oidc:carol"
+    assert record["auth_user_id"] == 'auth:v1:["oidc","","carol"]'
+    assert server._session_auth_user_id(record) == 'auth:v1:["oidc","","carol"]'
 
 
 def test_compute_host_turn_frame_carries_the_session_login(monkeypatch):
@@ -4773,7 +4778,7 @@ def test_compute_host_turn_frame_carries_the_session_login(monkeypatch):
 
     frame = server._compute_host_turn_frame("rid", "sid-host", record, "hello")
 
-    assert frame["auth_user_id"] == "basic:alice"
+    assert frame["auth_user_id"] == 'auth:v1:["basic","","alice"]'
 
 
 def test_attaching_a_different_login_keeps_the_creator_and_warns_once(monkeypatch):
@@ -4785,7 +4790,7 @@ def test_attaching_a_different_login_keeps_the_creator_and_warns_once(monkeypatc
     assert server._attach_session_transport(record, other)
     assert server._attach_session_transport(record, other)
 
-    assert server._session_auth_user_id(record) == "basic:alice"
+    assert server._session_auth_user_id(record) == 'auth:v1:["basic","","alice"]'
 
 
 def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):

@@ -6,6 +6,17 @@ form (gateway/session_identity.py). ``authorize_history`` compared the two byte 
 right logged-in user got ``permission_denied`` on rows it owned (#138950 review). The label maps
 only for an issuer-less login — the label drops the issuer, so an issuer-bearing subject must not
 claim one — and never to anything that itself reads as a subject.
+
+As of the full-subject stamping change, Desktop stamps NEW rows with the complete
+``auth:v1:[provider, issuer, user]`` subject directly (``authenticated_subject``) instead of the
+lossy ``<provider>:<user>`` label — every real OIDC login carries a non-empty issuer, and the old
+label dropped it unconditionally, so an issuer-bearing login could never satisfy an exact match
+against its own row. ``_login_label`` above is UNCHANGED and still correct for its original,
+narrower scope: an issuer-LESS login's row, stamped before this change or by an old client still
+running the prior format. Rows stamped under the old lossy form by an issuer-BEARING login are
+handled by a separate, bounded legacy fallback (``_legacy_transport_label`` /
+``_legacy_label_eligible``) that only ever resolves a row provably created before this host's
+recorded cutover to full-subject stamping — see the tests below this line.
 """
 
 import pytest
@@ -106,3 +117,89 @@ def test_a_forwarded_bob_cannot_mutate_a_row_bound_to_alice(db):
             authorize_history(conn, _actor(bob, db.db_path.parent), "alice-row", claim=True)
         assert getattr(raised.value, "reason", None) == "permission_denied"
         assert authorize_history(conn, _actor(alice, db.db_path.parent), "alice-row") is True
+
+
+# --- Legacy-cutover fallback: an issuer-bearing login reclaiming a pre-fix row -------------
+
+OIDC_LOGIN = 'auth:v1:["self-hosted","https://idp.example","userid:123"]'
+
+
+def _backdate(db, row_id, *, started_at):
+    db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (started_at, row_id))
+    db._conn.commit()
+
+
+def _set_cutover(db, *, when):
+    from hermes_state_mutation_binding import _LEGACY_LABEL_CUTOVER_KEY
+    db._conn.execute(
+        "INSERT INTO state_meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_LEGACY_LABEL_CUTOVER_KEY, str(when)))
+    db._conn.commit()
+
+
+def test_a_fresh_store_already_has_a_cutover_marker(db):
+    """A brand-new store stamps the cutover at creation (alongside store_created_at_utc) so an
+    import of previously-exported legacy session data into it still has a boundary to compare
+    against — not just upgrading installs that pass through the version-gated migration chain."""
+    from hermes_state_mutation_binding import _LEGACY_LABEL_CUTOVER_KEY
+    with db._read_ctx() as conn:
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key=?", (_LEGACY_LABEL_CUTOVER_KEY,)).fetchone()
+    assert row is not None
+    assert float(row[0]) > 0
+
+
+def test_an_issuer_bearing_login_reclaims_a_pre_cutover_row_and_upgrades_it(db):
+    """The actual bug this fallback fixes: a self-hosted OIDC login, which always carries an
+    issuer, can reclaim a row stamped under the old lossy form before this host's cutover — and
+    the row is upgraded in place so every later check hits the precise match directly."""
+    db.create_session("oidc-row", source="desktop", user_id="self-hosted:userid:123")
+    _backdate(db, "oidc-row", started_at=0.0)  # older than any real cutover timestamp
+    with db._read_ctx() as conn:
+        assert authorize_history(conn, _actor(OIDC_LOGIN, db.db_path.parent), "oidc-row", claim=True) is True
+    with db._read_ctx() as conn:
+        row = conn.execute("SELECT user_id FROM sessions WHERE id=?", ("oidc-row",)).fetchone()
+    assert row["user_id"] == OIDC_LOGIN
+    # Second touch now matches the FIRST branch (exact subject) directly — no fallback needed.
+    assert _auth(db, OIDC_LOGIN, "oidc-row") is True
+
+
+def test_a_pre_cutover_row_still_refuses_a_different_real_user(db):
+    """The legacy fallback never widens who may claim a row — same provider, a genuinely
+    different user, still refused even though the row predates the cutover."""
+    mallory = 'auth:v1:["self-hosted","https://idp.example","userid:999"]'
+    db.create_session("oidc-row", source="desktop", user_id="self-hosted:userid:123")
+    _backdate(db, "oidc-row", started_at=0.0)
+    with db._read_ctx() as conn:
+        with pytest.raises(Exception) as raised:
+            authorize_history(conn, _actor(mallory, db.db_path.parent), "oidc-row", claim=True)
+        assert getattr(raised.value, "reason", None) == "permission_denied"
+
+
+def test_a_post_cutover_row_never_gets_the_legacy_benefit(db):
+    """Bounding by creation time, not just format: a row stamped with the old lossy label but
+    created AFTER this host's cutover is never eligible for the fallback — current code never
+    writes that format, so a mismatch here is a real foreign owner, not a legacy row. Proves the
+    bound actually holds rather than merely never triggering by coincidence."""
+    _set_cutover(db, when=1000.0)
+    db.create_session("suspicious-row", source="desktop", user_id="self-hosted:userid:123")
+    _backdate(db, "suspicious-row", started_at=2000.0)  # after the (test-set) cutover
+    with db._read_ctx() as conn:
+        with pytest.raises(Exception) as raised:
+            authorize_history(conn, _actor(OIDC_LOGIN, db.db_path.parent), "suspicious-row", claim=True)
+        assert getattr(raised.value, "reason", None) == "permission_denied"
+
+
+def test_no_cutover_marker_means_the_fallback_refuses_rather_than_guesses(db):
+    """A store somehow missing the marker (should not happen via the two writers above, but
+    never assumed) fails closed: the fallback does not fire just because a row looks old."""
+    from hermes_state_mutation_binding import _LEGACY_LABEL_CUTOVER_KEY
+    db._conn.execute("DELETE FROM state_meta WHERE key=?", (_LEGACY_LABEL_CUTOVER_KEY,))
+    db._conn.commit()
+    db.create_session("oidc-row", source="desktop", user_id="self-hosted:userid:123")
+    _backdate(db, "oidc-row", started_at=0.0)
+    with db._read_ctx() as conn:
+        with pytest.raises(Exception) as raised:
+            authorize_history(conn, _actor(OIDC_LOGIN, db.db_path.parent), "oidc-row", claim=True)
+        assert getattr(raised.value, "reason", None) == "permission_denied"

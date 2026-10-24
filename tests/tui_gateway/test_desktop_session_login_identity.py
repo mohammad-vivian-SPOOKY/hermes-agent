@@ -8,18 +8,28 @@ row-creating write just never passed it on, so every Desktop session read back
 from ``state.db`` with an empty ``user_id`` while Discord/Telegram sessions
 carried theirs (their adapters put the sender on the row at creation).
 
+``_transport_auth_user_id`` now stamps the full ``auth:v1:[provider, issuer, user]``
+subject (``gateway.session_identity.authenticated_subject``) instead of the shorter
+``<provider>:<user>`` label — the short form dropped the issuer unconditionally, so
+any login whose provider is pinned to more than one issuer (every real OIDC login)
+could never satisfy an exact-subject match against its own row later
+(``hermes_state_mutation_binding.py::authorize_history``). A row stamped under the
+old short form by an issuer-bearing login is still reachable via that module's
+bounded legacy fallback (see tests/hermes_state/test_history_login_label.py).
+
 Anonymous sessions (no password provider, legacy token, stdio) stay
 identity-less: nothing is inferred and nothing is stamped.
 """
 
 from __future__ import annotations
 
+from gateway.session_identity import authenticated_subject
 from hermes_state import SessionDB
 from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 
 _LOADED_USER = "alice"
-_LOGIN = f"basic:{_LOADED_USER}"
+_LOGIN = authenticated_subject({"provider": "basic", "issuer": "", "user_id": _LOADED_USER})
 
 
 class _LoginSocket:

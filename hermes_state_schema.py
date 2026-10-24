@@ -1009,10 +1009,17 @@ class SessionSchemaMixin:
             # Store provenance so fresh vs wiped stores are distinguishable.
             # See #97568.
             now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+            from hermes_state_mutation_binding import _LEGACY_LABEL_CUTOVER_KEY
             cursor.executemany(
                 "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
                 [("store_instance_id", str(uuid.uuid4())), ("store_created_at_utc", now_iso),
-                 (_MESSAGE_UID_BACKFILL_DONE, "1")],  # a fresh store has no legacy rows to backfill
+                 (_MESSAGE_UID_BACKFILL_DONE, "1"),  # a fresh store has no legacy rows to backfill
+                 # A fresh store's row-stamping has always used the full subject (no legacy
+                 # `<provider>:<user>` form is ever written by current code), so nothing predates
+                 # this moment in the store's own life — EXCEPT an import of previously-exported
+                 # legacy session data into this brand-new store, which is exactly the case this
+                 # marker exists to keep working (see hermes_state_mutation_binding.py).
+                 (_LEGACY_LABEL_CUTOVER_KEY, str(time.time()))],
             )
         else:
             self._run_data_migrations(cursor, row[0], fts5_available)
@@ -1130,6 +1137,19 @@ class SessionSchemaMixin:
         # v32: nothing to run here. The declared tables/columns #106742 added under v31 were already
         # created by _init_schema's executescript(SCHEMA_SQL) + _reconcile_columns() before this chain;
         # the version only records that the store has them (#140315).
+        # v33: stamp the cutover to full-subject row stamping (hermes_state_mutation_binding.py). A row
+        # created before this timestamp may still carry the old, issuer-dropped `<provider>:<user>` form
+        # — the marker lets authorize_history's legacy fallback stay bounded to genuinely pre-existing
+        # rows forever, rather than guessing an equivalence for anything created afterward (which the
+        # CURRENT code never writes in the lossy form to begin with, so a post-cutover mismatch is a real
+        # foreign owner, not a legacy row). Written once, on first crossing — never overwritten, so a
+        # later migration run (or a replica catching up) does not move the boundary.
+        if current_version < 33:
+            from hermes_state_mutation_binding import _LEGACY_LABEL_CUTOVER_KEY
+            if cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key=?", (_LEGACY_LABEL_CUTOVER_KEY,)
+            ).fetchone() is None:
+                cursor.execute(_STATE_META_UPSERT_SQL, (_LEGACY_LABEL_CUTOVER_KEY, str(time.time())))
         # Advance schema_version — deliberately NOT gated on the FTS opt-in (that would block
         # every future migration for a user who never optimizes). FTS5 unavailable is the
         # one skip: claiming current would lie.
